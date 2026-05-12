@@ -122,7 +122,7 @@ async def _call_llm(messages: list) -> dict:
     content = data["choices"][0]["message"]["content"]
     usage = data.get("usage", {})
     return {
-        "analysis": json.loads(_extract_json(content)),
+        "analysis": json.loads(_extract_json(content), strict=False),
         "usage": usage,
     }
 

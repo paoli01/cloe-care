@@ -95,6 +95,34 @@ def _extract_json(content: str) -> str:
     return content
 
 
+def _parse_llm_json(raw: str) -> dict:
+    """Parse Haiku's JSON output, tolérant aux newlines unescaped dans les
+    strings. Sans `response_format=json_object`, Haiku peut renvoyer
+    {"message": "ligne 1\nligne 2"} avec un VRAI \\n littéral dans la
+    string — illégal en JSON strict mais courant en pratique. On essaie
+    strict d'abord, puis on retombe sur strict=False qui accepte les
+    control chars (0x00-0x1F) à l'intérieur des strings.
+    """
+    text = _extract_json(raw)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # strict=False tolère les newlines et autres control chars dans
+        # les strings, ce qui résout 95% des cas Haiku.
+        try:
+            return json.loads(text, strict=False)
+        except json.JSONDecodeError:
+            # Dernier recours : extraire à la main le champ `message` via regex
+            # et marquer elicitation_complete=False.
+            m = re.search(r'"message"\s*:\s*"((?:[^"\\]|\\.)*)"', text, re.DOTALL)
+            if m:
+                return {
+                    "message": m.group(1).replace("\\n", "\n").replace('\\"', '"'),
+                    "elicitation_complete": False,
+                }
+            raise
+
+
 async def call_llm(messages: list[dict]) -> dict:
     """Appel Haiku via cloe-proxy. Retourne le JSON parsé {message, elicitation_complete}."""
     payload_messages = [
@@ -117,7 +145,7 @@ async def call_llm(messages: list[dict]) -> dict:
 
     resp.raise_for_status()
     raw = resp.json()["choices"][0]["message"]["content"]
-    return json.loads(_extract_json(raw))
+    return _parse_llm_json(raw)
 
 
 async def stream_assistant_reply(ticket_id: str, user_message: str) -> AsyncIterator[str]:
@@ -200,7 +228,7 @@ async def build_user_summary(ticket_id: str) -> dict:
                 },
             )
         resp.raise_for_status()
-        return json.loads(_extract_json(resp.json()["choices"][0]["message"]["content"]))
+        return json.loads(_extract_json(resp.json()["choices"][0]["message"]["content"]), strict=False)
     except Exception:
         logger.exception("recap_llm_failed ticket=%s", ticket_id)
         # Fallback minimal : on prend le dernier message user comme "observé"

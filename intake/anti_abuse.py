@@ -133,7 +133,7 @@ Réponds UNIQUEMENT le JSON, rien d'autre."""
 
     content = resp.json()["choices"][0]["message"]["content"].strip()
     try:
-        data = json.loads(_extract_json(content))
+        data = json.loads(_extract_json(content), strict=False)
         return TriageResult(
             genuine=bool(data["genuine"]),
             confidence=float(data["confidence"]),
