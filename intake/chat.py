@@ -5,11 +5,12 @@ import logging
 import os
 import re
 import uuid
-from typing import AsyncIterator
+from typing import AsyncIterator, Optional
 
 import httpx
 
 from db import get_db
+from intake.context_light import build_client_context
 from intake.persona import CLOE_SUPPORT_SYSTEM_PROMPT, build_recap_request
 
 logger = logging.getLogger("cloe-care.intake")
@@ -123,10 +124,24 @@ def _parse_llm_json(raw: str) -> dict:
             raise
 
 
-async def call_llm(messages: list[dict]) -> dict:
-    """Appel Haiku via cloe-proxy. Retourne le JSON parsé {message, elicitation_complete}."""
+async def call_llm(messages: list[dict], client_id: Optional[str] = None) -> dict:
+    """Appel Haiku via OpenRouter. Retourne le JSON parsé.
+
+    Si `client_id` est fourni, on injecte un contexte léger (plan, sessions
+    récentes, dernière activité) dans le system prompt pour que Cloé pose
+    des questions pertinentes dès le 1er tour.
+    """
+    system_blocks = [CLOE_SUPPORT_SYSTEM_PROMPT]
+    if client_id:
+        try:
+            ctx = build_client_context(client_id)
+            if ctx:
+                system_blocks.append(ctx)
+        except Exception:
+            logger.exception("client_context_failed client=%s", client_id)
+
     payload_messages = [
-        {"role": "system", "content": CLOE_SUPPORT_SYSTEM_PROMPT}
+        {"role": "system", "content": "\n\n".join(system_blocks)}
     ] + messages
 
     async with httpx.AsyncClient(timeout=45) as client:
@@ -153,6 +168,16 @@ async def stream_assistant_reply(ticket_id: str, user_message: str) -> AsyncIter
     append_message(ticket_id, "user", user_message)
     messages = get_messages(ticket_id)
 
+    # Récupère le client_id pour enrichir le prompt avec le contexte client
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT client_id FROM tickets WHERE id = ?", (ticket_id,)
+        ).fetchone()
+        client_id = row["client_id"] if row else None
+    finally:
+        conn.close()
+
     # Émettre un keepalive SSE immédiat : le browser sait que la réponse a
     # démarré et n'avorte pas la connexion pendant le temps d'attente Haiku
     # (jusqu'à ~15s sur le hop bedrock).
@@ -167,7 +192,7 @@ async def stream_assistant_reply(ticket_id: str, user_message: str) -> AsyncIter
 
     # Pendant l'appel LLM, on émet un keepalive toutes les 5s pour garder le
     # canal vivant (certains proxys et browsers coupent une connexion idle).
-    llm_task = asyncio.create_task(call_llm(messages))
+    llm_task = asyncio.create_task(call_llm(messages, client_id=client_id))
     while not llm_task.done():
         try:
             await asyncio.wait_for(asyncio.shield(llm_task), timeout=5)
