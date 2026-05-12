@@ -52,3 +52,9 @@ def health():
         "service": "cloe-care",
         "version": "0.1.0",
     }
+
+
+# Routers (branchés progressivement à chaque PR feature/*)
+from routers import tickets  # noqa: E402
+
+app.include_router(tickets.router)
