@@ -1,9 +1,14 @@
-"""Étape résolution post-investigation : guard → apply → audit → escalade.
+"""Étape résolution post-investigation : guard → admin review → apply → audit.
 
-Importé via `_maybe_handle_resolution` dans `investigate_worker`. Le découplage
-permet à `feature/investigation` de fonctionner sans ce module ; quand
-`feature/apply-fix` est mergé, il devient disponible et `_maybe_handle_resolution`
-le détecte automatiquement.
+Depuis 09_ADMIN_VIEW :
+- Les catégories `config_client` et `data_client` s'arrêtent désormais à
+  `awaiting_admin_review`. L'application réelle du fix se fait via
+  `execute_fix_after_admin_approval` déclenché par `POST /admin/tickets/{id}/accept-fix`.
+- `code_transverse`, `ux` et `out_of_scope` gardent leur comportement automatique.
+
+Le découplage entre `investigate_worker` et ce module reste : si ce module
+n'est pas importable (avant `feature/apply-fix`), l'investigation continue
+de fonctionner sans la phase résolution.
 """
 import hashlib
 import json
@@ -79,6 +84,40 @@ async def handle_resolution(
     if not decision.allowed:
         await transition_async(ticket_id, "escalated", {"reason": decision.reason})
         await open_issue_for_code_transverse(ticket_id, analysis)
+        return
+
+    # Le guard a accepté → on attend la validation humaine. L'exécution
+    # réelle se fait via execute_fix_after_admin_approval() (voir routers/admin).
+    await transition_async(
+        ticket_id,
+        "awaiting_admin_review",
+        {
+            "fix_type": fix_proposal.get("type"),
+            "target_path": fix_proposal.get("target_path"),
+            "pattern_fingerprint": fingerprint_val,
+            "occurrences": occurrences,
+        },
+    )
+
+
+async def execute_fix_after_admin_approval(
+    ticket_id: str,
+    ticket: dict,
+    analysis: dict,
+    fingerprint_val: str,
+    occurrences: int,
+) -> None:
+    """Exécute le fix après accord admin. Lancée en background task."""
+    fix_proposal = analysis.get("fix_proposal") or {}
+
+    # Défense en profondeur : on revalide même après accord humain
+    decision = evaluate(fix_proposal, analysis.get("category") or "")
+    if not decision.allowed:
+        await transition_async(
+            ticket_id,
+            "escalated",
+            {"reason": f"guard_blocked_post_admin:{decision.reason}"},
+        )
         return
 
     await transition_async(ticket_id, "fixing")
