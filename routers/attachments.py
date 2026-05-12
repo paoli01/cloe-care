@@ -1,0 +1,233 @@
+"""Upload, listing, miniature et suppression des pièces jointes."""
+import json
+import logging
+import os
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi.responses import FileResponse
+
+from auth import (
+    JWTPayload,
+    validate_attachment_id,
+    validate_ticket_id,
+    verify_jwt,
+    verify_tenant,
+)
+from db import get_db
+from intake.attachments import (
+    AttachmentTooLarge,
+    AttachmentTypeNotAllowed,
+    process_attachment,
+)
+
+logger = logging.getLogger("cloe-care.attachments")
+
+router = APIRouter(prefix="/tickets/{ticket_id}/attachments", tags=["attachments"])
+
+
+def _max_per_ticket() -> int:
+    return int(os.getenv("MAX_ATTACHMENTS_PER_TICKET", "5"))
+
+
+def _load_ticket_and_verify(ticket_id: str, payload: JWTPayload) -> dict:
+    validate_ticket_id(ticket_id)
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="ticket_not_found")
+        verify_tenant(row["client_id"], payload)
+        return dict(row)
+    finally:
+        conn.close()
+
+
+def _count_attachments(ticket_id: str) -> int:
+    conn = get_db()
+    try:
+        return conn.execute(
+            "SELECT COUNT(*) FROM attachments WHERE ticket_id = ?", (ticket_id,)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+
+@router.post("")
+async def upload_attachment(
+    ticket_id: str,
+    file: UploadFile = File(...),
+    payload: JWTPayload = Depends(verify_jwt),
+):
+    ticket = _load_ticket_and_verify(ticket_id, payload)
+
+    if ticket["status"] not in ("draft", "received"):
+        raise HTTPException(
+            status_code=400,
+            detail="cannot_attach_after_investigation_started",
+        )
+
+    max_per_ticket = _max_per_ticket()
+    if _count_attachments(ticket_id) >= max_per_ticket:
+        raise HTTPException(
+            status_code=400,
+            detail=f"max_{max_per_ticket}_attachments",
+        )
+
+    raw = await file.read()
+
+    try:
+        result = process_attachment(
+            ticket_id=ticket_id,
+            raw=raw,
+            filename=file.filename or "unknown",
+            mime_type=file.content_type or "application/octet-stream",
+        )
+    except AttachmentTooLarge:
+        raise HTTPException(status_code=413, detail="file_too_large")
+    except AttachmentTypeNotAllowed as e:
+        raise HTTPException(status_code=415, detail=f"unsupported_type: {e}")
+    except Exception as e:
+        logger.exception("attachment_processing_failed ticket=%s", ticket_id)
+        raise HTTPException(
+            status_code=500,
+            detail=f"processing_failed: {type(e).__name__}",
+        )
+
+    conn = get_db()
+    try:
+        conn.execute(
+            """INSERT INTO attachments
+                  (id, ticket_id, original_filename, mime_type,
+                   size_original, size_compressed, storage_path,
+                   thumbnail_path, content_hash, extracted_text, page_count)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                result.id,
+                ticket_id,
+                result.original_filename,
+                result.mime_type,
+                result.size_original,
+                result.size_compressed,
+                result.storage_path,
+                result.thumbnail_path,
+                result.content_hash,
+                result.extracted_text,
+                result.page_count,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO ticket_events (ticket_id, event_type, actor, payload) "
+            "VALUES (?, 'attachment_added', 'client', ?)",
+            (
+                ticket_id,
+                json.dumps(
+                    {"attachment_id": result.id, "mime": result.mime_type}
+                ),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {
+        "attachment_id": result.id,
+        "mime_type": result.mime_type,
+        "size_original": result.size_original,
+        "size_compressed": result.size_compressed,
+        "has_extracted_text": bool(result.extracted_text),
+        "page_count": result.page_count,
+    }
+
+
+@router.get("")
+async def list_attachments(
+    ticket_id: str,
+    payload: JWTPayload = Depends(verify_jwt),
+):
+    _load_ticket_and_verify(ticket_id, payload)
+
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """SELECT id, original_filename, mime_type, size_original,
+                      size_compressed, page_count, created_at,
+                      thumbnail_path IS NOT NULL AS has_thumbnail
+                 FROM attachments
+                WHERE ticket_id = ?
+                ORDER BY created_at""",
+            (ticket_id,),
+        ).fetchall()
+        return {"attachments": [dict(r) for r in rows]}
+    finally:
+        conn.close()
+
+
+@router.get("/{attachment_id}/thumbnail")
+async def get_thumbnail(
+    ticket_id: str,
+    attachment_id: str,
+    payload: JWTPayload = Depends(verify_jwt),
+):
+    _load_ticket_and_verify(ticket_id, payload)
+    validate_attachment_id(attachment_id)
+
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT thumbnail_path FROM attachments "
+            "WHERE id = ? AND ticket_id = ?",
+            (attachment_id, ticket_id),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    if not row or not row["thumbnail_path"]:
+        raise HTTPException(status_code=404, detail="no_thumbnail")
+
+    path = Path(row["thumbnail_path"])
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="thumbnail_missing_on_disk")
+
+    return FileResponse(str(path), media_type="image/jpeg")
+
+
+@router.delete("/{attachment_id}")
+async def delete_attachment(
+    ticket_id: str,
+    attachment_id: str,
+    payload: JWTPayload = Depends(verify_jwt),
+):
+    ticket = _load_ticket_and_verify(ticket_id, payload)
+    validate_attachment_id(attachment_id)
+
+    if ticket["status"] not in ("draft", "received"):
+        raise HTTPException(status_code=400, detail="immutable_after_investigation")
+
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT storage_path, thumbnail_path FROM attachments "
+            "WHERE id = ? AND ticket_id = ?",
+            (attachment_id, ticket_id),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="not_found")
+
+        for path_key in ("storage_path", "thumbnail_path"):
+            p = row[path_key]
+            if p and os.path.exists(p):
+                try:
+                    os.remove(p)
+                except OSError:
+                    logger.warning("attachment_file_remove_failed path=%s", p)
+
+        conn.execute(
+            "DELETE FROM attachments WHERE id = ? AND ticket_id = ?",
+            (attachment_id, ticket_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {"deleted": True}
