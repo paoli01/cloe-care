@@ -23,9 +23,23 @@ FALLBACK_ASSISTANT_OPENING = (
     "Bonjour, je suis Cloé Support. Pouvez-vous me raconter ce qui s'est passé ?"
 )
 
+# Message d'accueil envoyé automatiquement à la création du ticket. Affiche
+# au client le cadre qu'il doit remplir, sans appeler de LLM (zéro coût,
+# zéro latence). Sert aussi de contexte pour Haiku au tour suivant et
+# apparaît dans l'admin view.
+WELCOME_MESSAGE = (
+    "Bonjour, je suis Cloé Support. Pour bien comprendre votre souci, "
+    "dites-moi en quelques mots :\n"
+    "• Ce que vous essayiez de faire\n"
+    "• Ce que vous attendiez comme résultat\n"
+    "• Ce qui s'est passé à la place\n\n"
+    "Plus c'est précis, plus je règle ça vite. Vous pouvez aussi joindre "
+    "une capture ou un PDF en bas si ça aide."
+)
+
 
 def create_ticket(client_id: str) -> str:
-    """Crée un ticket en draft et trace l'event. Retourne l'ID public."""
+    """Crée un ticket en draft, trace l'event, seed le message d'accueil."""
     ticket_id = f"ticket_{uuid.uuid4().hex[:12]}"
     conn = get_db()
     try:
@@ -37,6 +51,10 @@ def create_ticket(client_id: str) -> str:
             "INSERT INTO ticket_events (ticket_id, event_type, actor, payload) "
             "VALUES (?, 'created', 'client', ?)",
             (ticket_id, json.dumps({"client_id": client_id})),
+        )
+        conn.execute(
+            "INSERT INTO chat_messages (ticket_id, role, content) VALUES (?, 'assistant', ?)",
+            (ticket_id, WELCOME_MESSAGE),
         )
         conn.commit()
         return ticket_id
