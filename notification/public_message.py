@@ -9,7 +9,7 @@ import httpx
 
 logger = logging.getLogger("cloe-care.public_message")
 
-CLOE_PROXY_URL = os.getenv("CLOE_PROXY_URL", "http://cloe-proxy:8000")
+CARE_LLM_BASE_URL = os.getenv("CARE_LLM_BASE_URL", "https://openrouter.ai/api/v1")
 OPERATOR_KEY = os.getenv("OPERATOR_OPENROUTER_KEY", "")
 PUBLIC_MSG_MODEL = os.getenv("CARE_PUBLIC_MSG_MODEL", "anthropic/claude-3-haiku")
 
@@ -129,11 +129,9 @@ async def generate_public_message(
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(
-                f"{CLOE_PROXY_URL}/v1/chat/completions",
+                f"{CARE_LLM_BASE_URL}/chat/completions",
                 headers={
                     "Authorization": f"Bearer {OPERATOR_KEY}",
-                    "X-Client-ID": os.getenv("CARE_LLM_BILLING_CLIENT_ID", "operator"),
-                    "X-Operator-Bill": "true",
                 },
                 json={
                     "model": PUBLIC_MSG_MODEL,

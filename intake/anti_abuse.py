@@ -7,7 +7,7 @@ from typing import Optional
 
 import httpx
 
-CLOE_PROXY_URL = os.getenv("CLOE_PROXY_URL", "http://cloe-proxy:8000")
+CARE_LLM_BASE_URL = os.getenv("CARE_LLM_BASE_URL", "https://openrouter.ai/api/v1")
 OPERATOR_KEY = os.getenv("OPERATOR_OPENROUTER_KEY", "")
 TRIAGE_MODEL = os.getenv("CARE_TRIAGE_MODEL", "anthropic/claude-3-haiku")
 
@@ -104,11 +104,9 @@ Réponds UNIQUEMENT le JSON, rien d'autre."""
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.post(
-                f"{CLOE_PROXY_URL}/v1/chat/completions",
+                f"{CARE_LLM_BASE_URL}/chat/completions",
                 headers={
                     "Authorization": f"Bearer {OPERATOR_KEY}",
-                    "X-Client-ID": os.getenv("CARE_LLM_BILLING_CLIENT_ID", "operator"),
-                    "X-Operator-Bill": "true",
                 },
                 json={
                     "model": TRIAGE_MODEL,
