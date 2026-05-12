@@ -88,7 +88,7 @@ async def call_llm(messages: list[dict]) -> dict:
             f"{CLOE_PROXY_URL}/v1/chat/completions",
             headers={
                 "Authorization": f"Bearer {OPERATOR_KEY}",
-                "X-Client-ID": "operator",
+                "X-Client-ID": os.getenv("CARE_LLM_BILLING_CLIENT_ID", "operator"),
                 "X-Operator-Bill": "true",
             },
             json={
@@ -162,7 +162,7 @@ async def build_user_summary(ticket_id: str) -> dict:
                 f"{CLOE_PROXY_URL}/v1/chat/completions",
                 headers={
                     "Authorization": f"Bearer {OPERATOR_KEY}",
-                    "X-Client-ID": "operator",
+                    "X-Client-ID": os.getenv("CARE_LLM_BILLING_CLIENT_ID", "operator"),
                     "X-Operator-Bill": "true",
                 },
                 json={

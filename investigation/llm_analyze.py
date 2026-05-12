@@ -109,7 +109,7 @@ async def _call_llm(messages: list) -> dict:
             f"{CLOE_PROXY_URL}/v1/chat/completions",
             headers={
                 "Authorization": f"Bearer {OPERATOR_KEY}",
-                "X-Client-ID": "operator",
+                "X-Client-ID": os.getenv("CARE_LLM_BILLING_CLIENT_ID", "operator"),
                 "X-Operator-Bill": "true",
             },
             json={
