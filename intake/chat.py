@@ -83,7 +83,7 @@ async def call_llm(messages: list[dict]) -> dict:
         {"role": "system", "content": CLOE_SUPPORT_SYSTEM_PROMPT}
     ] + messages
 
-    async with httpx.AsyncClient(timeout=20) as client:
+    async with httpx.AsyncClient(timeout=45) as client:
         resp = await client.post(
             f"{CLOE_PROXY_URL}/v1/chat/completions",
             headers={
@@ -96,7 +96,6 @@ async def call_llm(messages: list[dict]) -> dict:
                 "messages": payload_messages,
                 "temperature": 0.3,
                 "max_tokens": 500,
-                "response_format": {"type": "json_object"},
             },
         )
 
@@ -110,6 +109,11 @@ async def stream_assistant_reply(ticket_id: str, user_message: str) -> AsyncIter
     append_message(ticket_id, "user", user_message)
     messages = get_messages(ticket_id)
 
+    # Émettre un keepalive SSE immédiat : le browser sait que la réponse a
+    # démarré et n'avorte pas la connexion pendant le temps d'attente Haiku
+    # (jusqu'à ~15s sur le hop bedrock).
+    yield ": connected\n\n"
+
     if len(messages) > MAX_TURNS * 2:
         limit_msg = "On a déjà bien échangé, vous pouvez soumettre votre ticket dès maintenant."
         append_message(ticket_id, "assistant", limit_msg)
@@ -117,8 +121,17 @@ async def stream_assistant_reply(ticket_id: str, user_message: str) -> AsyncIter
         yield "data: " + json.dumps({"type": "done", "elicitation_complete": True}) + "\n\n"
         return
 
+    # Pendant l'appel LLM, on émet un keepalive toutes les 5s pour garder le
+    # canal vivant (certains proxys et browsers coupent une connexion idle).
+    llm_task = asyncio.create_task(call_llm(messages))
+    while not llm_task.done():
+        try:
+            await asyncio.wait_for(asyncio.shield(llm_task), timeout=5)
+        except asyncio.TimeoutError:
+            yield ": keepalive\n\n"
+
     try:
-        result = await call_llm(messages)
+        result = llm_task.result()
     except Exception:
         logger.exception("elicitation_llm_failed ticket=%s", ticket_id)
         fallback = "Petit souci de mon côté, pouvez-vous réessayer ?"
@@ -157,7 +170,7 @@ async def build_user_summary(ticket_id: str) -> dict:
     prompt = build_recap_request(messages)
 
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=45) as client:
             resp = await client.post(
                 f"{CLOE_PROXY_URL}/v1/chat/completions",
                 headers={
@@ -170,7 +183,6 @@ async def build_user_summary(ticket_id: str) -> dict:
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0,
                     "max_tokens": 600,
-                    "response_format": {"type": "json_object"},
                 },
             )
         resp.raise_for_status()
