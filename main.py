@@ -8,6 +8,12 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from db import init_db
+from workers.investigate_worker import (
+    is_worker_alive,
+    queue_size,
+    start_worker,
+    stop_worker,
+)
 
 load_dotenv()
 
@@ -20,7 +26,11 @@ logging.basicConfig(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    yield
+    start_worker()
+    try:
+        yield
+    finally:
+        stop_worker()
 
 
 app = FastAPI(
@@ -51,6 +61,8 @@ def health():
         "status": "ok",
         "service": "cloe-care",
         "version": "0.1.0",
+        "queue_size": queue_size(),
+        "worker_alive": is_worker_alive(),
     }
 
 
