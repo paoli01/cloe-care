@@ -11,6 +11,7 @@ import logging
 
 from db import get_db
 from investigation.pattern_detect import should_propose_global_fix
+from notification.transition import transition_async
 from resolution.apply_client import ApplyResult, apply_patch
 from resolution.apply_guard import evaluate
 from resolution.global_fix import (
@@ -19,24 +20,6 @@ from resolution.global_fix import (
 )
 
 logger = logging.getLogger("cloe-care.resolution")
-
-
-def _transition(ticket_id: str, status: str, extra: dict | None = None) -> None:
-    """Transition sync de base. Remplacée par la version SSE/email en 06."""
-    conn = get_db()
-    try:
-        conn.execute(
-            "UPDATE tickets SET status = ?, updated_at = datetime('now') WHERE id = ?",
-            (status, ticket_id),
-        )
-        conn.execute(
-            "INSERT INTO ticket_events (ticket_id, event_type, actor, payload) "
-            "VALUES (?, ?, 'system', ?)",
-            (ticket_id, f"transition_{status}", json.dumps(extra or {})),
-        )
-        conn.commit()
-    finally:
-        conn.close()
 
 
 def _log_apply_audit(
@@ -81,41 +64,41 @@ async def handle_resolution(
     category = analysis.get("category")
 
     if category in ("ux", "out_of_scope"):
-        _transition(ticket_id, "no_action", {"reason": category})
-        _transition(ticket_id, "resolved")
+        await transition_async(ticket_id, "no_action", {"reason": category})
+        await transition_async(ticket_id, "resolved")
         return
 
     if category == "code_transverse":
         issue_url = await open_issue_for_code_transverse(ticket_id, analysis)
-        _transition(ticket_id, "escalated", {"issue_url": issue_url})
+        await transition_async(ticket_id, "escalated", {"issue_url": issue_url})
         return
 
     fix_proposal = analysis.get("fix_proposal") or {}
     decision = evaluate(fix_proposal, category or "")
 
     if not decision.allowed:
-        _transition(ticket_id, "escalated", {"reason": decision.reason})
+        await transition_async(ticket_id, "escalated", {"reason": decision.reason})
         await open_issue_for_code_transverse(ticket_id, analysis)
         return
 
-    _transition(ticket_id, "fixing")
+    await transition_async(ticket_id, "fixing")
     result = await apply_patch(ticket_id, ticket["client_id"], fix_proposal)
     _log_apply_audit(ticket_id, ticket["client_id"], fix_proposal, result)
 
     if not result.success:
         if result.rolled_back:
-            _transition(
+            await transition_async(
                 ticket_id,
                 "fix_rolled_back",
                 {"detail": result.detail, "healthcheck": result.healthcheck_status},
             )
-            _transition(
+            await transition_async(
                 ticket_id,
                 "escalated",
                 {"reason": "rollback_after_fix_failed"},
             )
         else:
-            _transition(
+            await transition_async(
                 ticket_id,
                 "escalated",
                 {"detail": result.detail, "healthcheck": result.healthcheck_status},
@@ -123,7 +106,9 @@ async def handle_resolution(
             await open_issue_for_code_transverse(ticket_id, analysis)
         return
 
-    _transition(ticket_id, "fix_applied", {"healthcheck": result.healthcheck_status})
+    await transition_async(
+        ticket_id, "fix_applied", {"healthcheck": result.healthcheck_status}
+    )
 
     if should_propose_global_fix(
         occurrences, analysis.get("global_implication", "unknown")
@@ -131,6 +116,6 @@ async def handle_resolution(
         pr_url = await open_pr_for_global_pattern(
             ticket_id, analysis, fingerprint_val
         )
-        _transition(ticket_id, "proposing_global", {"pr_url": pr_url})
+        await transition_async(ticket_id, "proposing_global", {"pr_url": pr_url})
 
-    _transition(ticket_id, "resolved")
+    await transition_async(ticket_id, "resolved")

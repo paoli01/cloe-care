@@ -16,6 +16,7 @@ from db import get_db
 from investigation.context_gather import gather_context
 from investigation.llm_analyze import investigate
 from investigation.pattern_detect import fingerprint, record_pattern
+from notification.transition import transition_async
 
 logger = logging.getLogger("cloe-care.worker")
 
@@ -51,22 +52,9 @@ def _load_ticket(ticket_id: str) -> Optional[dict]:
         conn.close()
 
 
-def _transition(ticket_id: str, status: str, extra: Optional[dict] = None) -> None:
-    """Transition synchrone basique. Remplacée par `transition_async` en 06."""
-    conn = get_db()
-    try:
-        conn.execute(
-            "UPDATE tickets SET status = ?, updated_at = datetime('now') WHERE id = ?",
-            (status, ticket_id),
-        )
-        conn.execute(
-            "INSERT INTO ticket_events (ticket_id, event_type, actor, payload) "
-            "VALUES (?, ?, 'system', ?)",
-            (ticket_id, f"transition_{status}", json.dumps(extra or {})),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+# Transitions passent désormais par notification.transition.transition_async,
+# qui génère le public_message, met à jour la BDD, publie le SSE et envoie
+# l'email transactionnel sur les états terminaux.
 
 
 def _persist_analysis(ticket_id: str, result: dict) -> None:
@@ -122,7 +110,7 @@ async def _process_one(ticket_id: str) -> None:
         )
         return
 
-    _transition(ticket_id, "investigating")
+    await transition_async(ticket_id, "investigating")
 
     try:
         session_id = (json.loads(ticket["user_summary"] or "{}")
@@ -138,7 +126,7 @@ async def _process_one(ticket_id: str) -> None:
         fp = fingerprint(analysis.get("root_cause", ""), analysis.get("category", ""))
         occurrences = record_pattern(ticket_id, fp)
 
-        _transition(
+        await transition_async(
             ticket_id,
             "analyzed",
             {
@@ -153,10 +141,10 @@ async def _process_one(ticket_id: str) -> None:
 
     except asyncio.TimeoutError:
         logger.exception("investigation_timeout ticket_id=%s", ticket_id)
-        _transition(ticket_id, "escalated", {"reason": "investigation_timeout"})
+        await transition_async(ticket_id, "escalated", {"reason": "investigation_timeout"})
     except Exception as e:
         logger.exception("investigation_failed ticket_id=%s", ticket_id)
-        _transition(
+        await transition_async(
             ticket_id,
             "escalated",
             {"reason": f"investigation_error: {type(e).__name__}"},

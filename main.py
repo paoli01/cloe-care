@@ -67,7 +67,8 @@ def health():
 
 
 # Routers (branchés progressivement à chaque PR feature/*)
-from routers import attachments, tickets  # noqa: E402
+from routers import attachments, status as status_router, tickets  # noqa: E402
 
 app.include_router(tickets.router)
 app.include_router(attachments.router)
+app.include_router(status_router.router)
