@@ -227,14 +227,15 @@ async def stream_assistant_reply(ticket_id: str, user_message: str) -> AsyncIter
 async def build_user_summary(ticket_id: str) -> dict:
     """Génère le récapitulatif structuré à partir du chat complet."""
     messages = get_messages(ticket_id)
+    empty_summary = {
+        "context": "",
+        "intent": "",
+        "expected": "",
+        "observed": "",
+        "additional": "",
+    }
     if not messages:
-        return {
-            "what_user_did": None,
-            "expected": None,
-            "observed": None,
-            "when": None,
-            "additional_context": None,
-        }
+        return empty_summary
 
     prompt = build_recap_request(messages)
 
@@ -256,15 +257,15 @@ async def build_user_summary(ticket_id: str) -> dict:
         return json.loads(_extract_json(resp.json()["choices"][0]["message"]["content"]), strict=False)
     except Exception:
         logger.exception("recap_llm_failed ticket=%s", ticket_id)
-        # Fallback minimal : on prend le dernier message user comme "observé"
+        # Fallback minimal : on prend le dernier message user comme "observed"
         last_user = next(
             (m["content"] for m in reversed(messages) if m["role"] == "user"),
-            None,
+            "",
         )
         return {
-            "what_user_did": None,
-            "expected": None,
-            "observed": last_user,
-            "when": None,
-            "additional_context": "recap_llm_failed",
+            "context": "",
+            "intent": "",
+            "expected": "",
+            "observed": last_user or "",
+            "additional": "recap_llm_failed",
         }

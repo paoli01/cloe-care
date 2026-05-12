@@ -40,18 +40,34 @@ Si ton message est une question de confirmation type "Est-ce bien cela ?" ou "Ai
 
 
 def build_recap_request(messages: list[dict]) -> str:
+    """Récapitulatif structuré en 5 catégories standardisées.
+
+    Pattern identique pour tous les tickets, exposé tel quel dans la
+    pop-up de confirmation côté frontend et dans la vue admin.
+    """
     transcript = "\n".join(f"[{m['role']}] {m['content']}" for m in messages)
-    return f"""À partir de la conversation suivante, génère un résumé structuré du problème.
+    return f"""À partir de la conversation suivante avec le client, génère un récapitulatif structuré du ticket.
 
 Conversation :
 {transcript}
 
-Réponds en JSON strict :
+Réponds UNIQUEMENT en JSON strict avec exactement ces 5 champs :
+
 {{
-  "what_user_did": "...",
+  "context": "...",
+  "intent": "...",
   "expected": "...",
   "observed": "...",
-  "when": "..." ou null,
-  "additional_context": "..." ou null
+  "additional": "..."
 }}
+
+Définitions :
+- "context" : situation générale, fonctionnalité concernée, quand le problème survient
+- "intent" : ce que le client essayait de faire (l'action initiale)
+- "expected" : ce qu'il attendait comme résultat
+- "observed" : ce qui s'est passé à la place
+- "additional" : infos complémentaires (étapes pour reproduire, fréquence, captures mentionnées)
+
+Si une catégorie n'a pas été abordée, mets une chaîne vide "". Pas de null, pas d'absent.
+Reste factuel, ne paraphrase pas Cloé Support, reprends seulement les éléments concrets du client.
 """

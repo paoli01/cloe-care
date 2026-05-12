@@ -99,6 +99,45 @@ async def list_messages(
     return {"messages": get_messages(ticket_id)}
 
 
+@router.post("/{ticket_id}/preview-summary")
+async def preview_summary(
+    ticket_id: str,
+    payload: JWTPayload = Depends(verify_jwt),
+):
+    """Génère et cache le récap structuré 5 catégories pour la pop-up de
+    confirmation. Si déjà généré, on retourne le cache (évite un 2e appel
+    Haiku au moment du clic Soumettre).
+    """
+    validate_ticket_id(ticket_id)
+    ticket = _load_ticket_or_404(ticket_id)
+    verify_tenant(ticket["client_id"], payload)
+
+    if ticket["status"] != "draft":
+        raise HTTPException(status_code=400, detail="already_submitted")
+
+    cached = ticket.get("user_summary")
+    if cached:
+        try:
+            data = json.loads(cached)
+            if all(k in data for k in ("context", "intent", "expected", "observed", "additional")):
+                return {"summary": data, "cached": True}
+        except (TypeError, ValueError):
+            pass
+
+    summary = await build_user_summary(ticket_id)
+    conn = get_db()
+    try:
+        conn.execute(
+            "UPDATE tickets SET user_summary = ?, updated_at = datetime('now') WHERE id = ?",
+            (json.dumps(summary, ensure_ascii=False), ticket_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {"summary": summary, "cached": False}
+
+
 @router.post("/{ticket_id}/submit", response_model=SubmitResponse)
 async def submit_ticket(
     ticket_id: str,
@@ -111,7 +150,19 @@ async def submit_ticket(
     if ticket["status"] != "draft":
         raise HTTPException(status_code=400, detail="already_submitted")
 
-    user_summary = await build_user_summary(ticket_id)
+    # Réutilise le summary généré par /preview-summary si dispo, sinon le
+    # génère maintenant. Évite le double appel Haiku.
+    cached = ticket.get("user_summary")
+    user_summary: dict | None = None
+    if cached:
+        try:
+            user_summary = json.loads(cached)
+            if not all(k in user_summary for k in ("context", "intent", "expected", "observed", "additional")):
+                user_summary = None
+        except (TypeError, ValueError):
+            user_summary = None
+    if user_summary is None:
+        user_summary = await build_user_summary(ticket_id)
     chat_messages = get_messages(ticket_id)
     triage = await llm_triage(user_summary, chat_messages)
 
