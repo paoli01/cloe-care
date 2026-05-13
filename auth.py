@@ -152,3 +152,22 @@ async def verify_admin(payload: JWTPayload = Depends(verify_jwt)) -> JWTPayload:
         raise HTTPException(status_code=403, detail="not_admin")
     payload.email = email
     return payload
+
+
+# ─── Auth service-to-service (cloe-api → cloe-care) ───────────────────────────
+
+
+async def verify_service_key(
+    x_service_key: Optional[str] = Header(None, alias="X-Service-Key"),
+) -> None:
+    """Garde-fou pour les endpoints appelés par cloe-api uniquement.
+
+    Le secret ``CARE_SERVICE_KEY`` est partagé entre cloe-api et cloe-care
+    (même valeur dans les deux ``.env``). Sans clé configurée, l'endpoint
+    est désactivé (503) — meilleur "fail closed" qu'une porte ouverte.
+    """
+    expected = os.environ.get("CARE_SERVICE_KEY", "").strip()
+    if not expected:
+        raise HTTPException(status_code=503, detail="service_key_not_configured")
+    if not x_service_key or x_service_key != expected:
+        raise HTTPException(status_code=401, detail="invalid_service_key")

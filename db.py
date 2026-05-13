@@ -30,6 +30,12 @@ def init_db() -> None:
 def _migrate(conn: sqlite3.Connection) -> None:
     """Migrations douces (idempotentes) pour les colonnes ajoutées après v0."""
     _add_column_if_missing(conn, "tickets", "admin_refusal_reason", "TEXT")
+    # Pivot Cloé Aide (Expert Hermes) : un ticket peut désormais être créé par
+    # cloe-api via /tickets/internal avec un visibility et une priority dédiés.
+    # `visibility=internal` masque le ticket dans la vue client (feedback produit).
+    _add_column_if_missing(conn, "tickets", "visibility", "TEXT NOT NULL DEFAULT 'client'")
+    _add_column_if_missing(conn, "tickets", "priority", "TEXT NOT NULL DEFAULT 'normal'")
+    _add_column_if_missing(conn, "tickets", "source", "TEXT NOT NULL DEFAULT 'intake'")
 
 
 def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, type_: str) -> None:

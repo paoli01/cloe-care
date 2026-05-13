@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 from auth import (
     JWTPayload,
+    _lookup_email_by_client_id,
     validate_ticket_id,
     verify_admin,
     verify_jwt,
@@ -84,8 +85,10 @@ async def list_tickets(
     try:
         rows = conn.execute(
             f"""SELECT id, client_id, status, category, public_status_label,
-                       public_message, severity, investigation_acu_cost,
-                       attachments_analyzed, created_at, updated_at, resolved_at
+                       public_message, user_summary, severity,
+                       investigation_acu_cost, attachments_analyzed,
+                       visibility, priority, source,
+                       created_at, updated_at, resolved_at
                   FROM tickets
                  WHERE {where_sql}
                  ORDER BY
@@ -101,12 +104,40 @@ async def list_tickets(
     finally:
         conn.close()
 
+    tickets_out: list[dict] = []
+    for r in rows:
+        d = dict(r)
+        d["topic"] = _admin_extract_topic(d.pop("user_summary", None))
+        tickets_out.append(d)
+
     return {
         "total": total,
         "limit": limit,
         "offset": offset,
-        "tickets": [dict(r) for r in rows],
+        "tickets": tickets_out,
     }
+
+
+def _admin_extract_topic(user_summary_raw: Optional[str]) -> Optional[str]:
+    """Snippet ~100 chars dérivé du récap utilisateur pour identifier le
+    ticket dans la liste admin. Préfère ``observed`` (le symptôme), fallback
+    sur ``context``, ``intent``, ``what_user_did``.
+    """
+    if not user_summary_raw:
+        return None
+    try:
+        data = json.loads(user_summary_raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    for key in ("observed", "context", "intent", "what_user_did"):
+        text = (data.get(key) or "").strip()
+        if text:
+            if len(text) <= 100:
+                return text
+            return text[:100].rsplit(" ", 1)[0] + "…"
+    return None
 
 
 @router.get("/tickets/{ticket_id}")
@@ -171,8 +202,14 @@ async def ticket_detail(
     finally:
         conn.close()
 
+    # Résout l'email depuis le registry cloe-api (RO mount). Best-effort —
+    # si le registry est inaccessible, on renvoie None et le front affiche
+    # juste le client_id.
+    client_email = _lookup_email_by_client_id(ticket["client_id"])
+
     return {
         "ticket": ticket,
+        "client_email": client_email,
         "user_summary": _safe_json(ticket["user_summary"]) or {},
         "investigation_report": _safe_json(ticket["investigation_report"]),
         "proposed_fix": _safe_json(ticket["proposed_fix"]),
@@ -310,6 +347,120 @@ async def refuse_fix(
     )
 
     return {"ticket_id": ticket_id, "status": "refused"}
+
+
+class AdminNoteRequest(BaseModel):
+    content: str = Field(..., min_length=1, max_length=4000)
+
+
+@router.post("/tickets/{ticket_id}/note")
+async def add_admin_note(
+    ticket_id: str,
+    body: AdminNoteRequest,
+    admin: JWTPayload = Depends(verify_admin),
+):
+    """Ajoute une note admin libre sur un ticket.
+
+    Persistée dans ``ticket_events`` avec ``event_type='admin_note'``,
+    actor=email admin. Visible dans l'audit trail de la fiche détail.
+    """
+    validate_ticket_id(ticket_id)
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT id FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="ticket_not_found")
+        conn.execute(
+            "INSERT INTO ticket_events (ticket_id, event_type, actor, payload) "
+            "VALUES (?, 'admin_note', ?, ?)",
+            (ticket_id, admin.email or "admin", json.dumps({"note": body.content})),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    logger.info("admin_note ticket=%s admin=%s", ticket_id, admin.email)
+    return {"ok": True}
+
+
+class AdminPublicMessageRequest(BaseModel):
+    content: str = Field(..., min_length=1, max_length=2000)
+
+
+@router.post("/tickets/{ticket_id}/public-message")
+async def set_public_message(
+    ticket_id: str,
+    body: AdminPublicMessageRequest,
+    admin: JWTPayload = Depends(verify_admin),
+):
+    """Met à jour le message public visible par le client sur sa fiche ticket.
+
+    Différent de ``/note`` qui est interne. Écrit aussi un event
+    ``public_message_updated`` dans l'audit trail avec le contenu, pour
+    garder l'historique des communications client.
+    """
+    validate_ticket_id(ticket_id)
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT id FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="ticket_not_found")
+        conn.execute(
+            "UPDATE tickets SET public_message = ?, updated_at = datetime('now') "
+            "WHERE id = ?",
+            (body.content, ticket_id),
+        )
+        conn.execute(
+            "INSERT INTO ticket_events (ticket_id, event_type, actor, payload) "
+            "VALUES (?, 'public_message_updated', ?, ?)",
+            (ticket_id, admin.email or "admin", json.dumps({"message": body.content})),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    logger.info("admin_public_message ticket=%s admin=%s", ticket_id, admin.email)
+    return {"ok": True}
+
+
+class AdminStatusRequest(BaseModel):
+    status: str
+    reason: Optional[str] = Field(None, max_length=500)
+
+
+@router.post("/tickets/{ticket_id}/status")
+async def admin_change_status(
+    ticket_id: str,
+    body: AdminStatusRequest,
+    admin: JWTPayload = Depends(verify_admin),
+):
+    """Change le statut d'un ticket à n'importe quel statut valide.
+
+    Utilise ``transition_async`` pour notifier (push, webhook) et tenir
+    le public_message à jour. La raison optionnelle est jointe à l'event.
+    """
+    validate_ticket_id(ticket_id)
+    if body.status not in VALID_STATUSES:
+        raise HTTPException(status_code=400, detail=f"invalid_status: {body.status}")
+
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT id FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="ticket_not_found")
+    finally:
+        conn.close()
+
+    payload: dict = {"by_admin": admin.email}
+    if body.reason:
+        payload["reason"] = body.reason
+    await transition_async(ticket_id, body.status, payload)
+
+    logger.info(
+        "admin_status_change ticket=%s status=%s admin=%s",
+        ticket_id, body.status, admin.email,
+    )
+    return {"ok": True, "status": body.status}
 
 
 @router.get("/stats")

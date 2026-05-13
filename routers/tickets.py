@@ -1,7 +1,8 @@
 """Routes principales : création de ticket, chat élicitation, soumission, listing."""
 import json
 import logging
-from typing import Optional
+import uuid
+from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -9,8 +10,10 @@ from pydantic import BaseModel, Field
 
 from auth import (
     JWTPayload,
+    validate_client_id,
     validate_ticket_id,
     verify_jwt,
+    verify_service_key,
     verify_tenant,
 )
 from db import get_db
@@ -251,14 +254,37 @@ async def get_ticket(
     ticket_id: str,
     payload: JWTPayload = Depends(verify_jwt),
 ):
+    """Détails d'un ticket pour la page de suivi.
+
+    Inclut le ``user_summary`` parsé (5 catégories validées par le client
+    dans la modal de confirmation Cloé Aide) et ``source_session_id`` pour
+    permettre au front de proposer un lien vers la conversation Cloé Aide
+    d'origine (où vivent les pièces jointes et l'historique de chat).
+    """
     validate_ticket_id(ticket_id)
     ticket = _load_ticket_or_404(ticket_id)
     verify_tenant(ticket["client_id"], payload)
+
+    user_summary: Optional[dict] = None
+    raw_summary = ticket.get("user_summary")
+    if raw_summary:
+        try:
+            parsed = json.loads(raw_summary)
+            if isinstance(parsed, dict):
+                user_summary = parsed
+        except (TypeError, ValueError):
+            pass
+
     return {
         "ticket_id": ticket_id,
         "status": ticket["status"],
         "public_status_label": ticket.get("public_status_label"),
         "public_message": ticket.get("public_message"),
+        "user_summary": user_summary,
+        "category": ticket.get("category"),
+        "priority": ticket.get("priority"),
+        "source": ticket.get("source"),
+        "source_session_id": ticket.get("chat_session_id"),
         "updated_at": ticket["updated_at"],
         "created_at": ticket["created_at"],
         "resolved_at": ticket.get("resolved_at"),
@@ -267,17 +293,177 @@ async def get_ticket(
 
 @router.get("")
 async def list_tickets(payload: JWTPayload = Depends(verify_jwt)):
+    """Liste des tickets visibles côté client.
+
+    Les tickets ``visibility='internal'`` (feedback produit créé en silence
+    par Cloé Aide lors d'un refus) sont filtrés — invisibles par design.
+
+    Inclut un snippet ``topic`` dérivé du ``user_summary`` (mots du client)
+    pour que la carte ticket soit identifiable même quand le
+    ``public_message`` est générique ("Transmis à notre équipe humaine").
+    """
     conn = get_db()
     try:
         rows = conn.execute(
             """SELECT id, status, public_status_label, public_message,
-                      created_at, updated_at, resolved_at
+                      user_summary, created_at, updated_at, resolved_at
                  FROM tickets
                 WHERE client_id = ?
+                  AND visibility = 'client'
                 ORDER BY created_at DESC
                 LIMIT 50""",
             (payload.client_id,),
         ).fetchall()
-        return {"tickets": [dict(r) for r in rows]}
+        out: list[dict] = []
+        for r in rows:
+            d = dict(r)
+            d["topic"] = _extract_topic(d.pop("user_summary", None))
+            out.append(d)
+        return {"tickets": out}
     finally:
         conn.close()
+
+
+def _extract_topic(user_summary_raw: Optional[str]) -> Optional[str]:
+    """Snippet 80 chars dérivé du récap 5-catégories pour identifier un
+    ticket dans la liste. Préfère ``observed`` (ce qui s'est passé), fall-
+    back sur ``context`` (situation), puis ``intent``.
+    """
+    if not user_summary_raw:
+        return None
+    try:
+        data = json.loads(user_summary_raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    for key in ("observed", "context", "intent"):
+        text = (data.get(key) or "").strip()
+        if text:
+            if len(text) <= 80:
+                return text
+            return text[:80].rsplit(" ", 1)[0] + "…"
+    return None
+
+
+# ─── Création service-to-service (cloe-api → cloe-care) ──────────────────────
+
+
+class InternalSummary(BaseModel):
+    context: str = ""
+    intent: str = ""
+    expected: str = ""
+    observed: str = ""
+    additional: str = ""
+
+
+class InternalIncidentRequest(BaseModel):
+    """Payload émis par cloe-api quand l'Expert ``cloe_aide`` produit un
+    marker ``[[create_incident: ...]]``."""
+    client_id: str = Field(..., min_length=1, max_length=64)
+    category: Literal[
+        "technical_bug",
+        "personalized_support",
+        "config_beyond_self_service",
+        "out_of_product_scope",
+    ]
+    visibility: Literal["client", "internal"] = "client"
+    priority: Literal["ultra_low", "low", "normal", "high"] = "normal"
+    summary: InternalSummary
+    source_session_id: Optional[str] = Field(None, max_length=64)
+    user_facing_message: Optional[str] = Field(None, max_length=500)
+
+
+class InternalIncidentResponse(BaseModel):
+    ticket_id: str
+    status: str
+    visibility: str
+    priority: str
+
+
+@router.post("/internal", response_model=InternalIncidentResponse)
+async def create_internal_incident(
+    body: InternalIncidentRequest,
+    _service: None = Depends(verify_service_key),
+):
+    """Création directe d'un ticket par un service amont (cloe-api).
+
+    Court-circuite le flow intake/draft : le récap 5-catégories arrive déjà
+    construit par Cloé Aide via la conversation Hermes. On passe direct au
+    statut final :
+    - ``visibility='client'`` → status ``received`` (visible dans /support,
+      le client voit la bannière dans le chat dashboard)
+    - ``visibility='internal'`` → status ``internal_feedback`` (invisible
+      côté client, feedback produit interne)
+    """
+    validate_client_id(body.client_id)
+
+    ticket_id = f"ticket_{uuid.uuid4().hex[:12]}"
+    status = "received" if body.visibility == "client" else "internal_feedback"
+    summary_json = json.dumps(body.summary.model_dump(), ensure_ascii=False)
+    public_status_label = "Reçu" if body.visibility == "client" else None
+    public_message = (
+        body.user_facing_message
+        if body.visibility == "client" and body.user_facing_message
+        else (
+            "C'est noté, je regarde ce qui s'est passé."
+            if body.visibility == "client"
+            else None
+        )
+    )
+
+    conn = get_db()
+    try:
+        conn.execute(
+            """INSERT INTO tickets (
+                    id, client_id, status, category, user_summary,
+                    chat_session_id, visibility, priority, source,
+                    public_status_label, public_message
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'cloe_aide', ?, ?)""",
+            (
+                ticket_id,
+                body.client_id,
+                status,
+                body.category,
+                summary_json,
+                body.source_session_id,
+                body.visibility,
+                body.priority,
+                public_status_label,
+                public_message,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO ticket_events (ticket_id, event_type, actor, payload) "
+            "VALUES (?, 'created', 'cloe_aide', ?)",
+            (
+                ticket_id,
+                json.dumps(
+                    {
+                        "category": body.category,
+                        "visibility": body.visibility,
+                        "priority": body.priority,
+                        "source_session_id": body.source_session_id,
+                    }
+                ),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    if body.visibility == "client":
+        _enqueue_for_investigation(ticket_id)
+
+    logger.info(
+        "ticket_internal_created ticket_id=%s client_id=%s category=%s "
+        "visibility=%s priority=%s",
+        ticket_id, body.client_id, body.category, body.visibility, body.priority,
+    )
+
+    return InternalIncidentResponse(
+        ticket_id=ticket_id,
+        status=status,
+        visibility=body.visibility,
+        priority=body.priority,
+    )
