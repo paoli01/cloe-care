@@ -1,0 +1,78 @@
+services:
+  cloe-care:
+    build: .
+    container_name: cloe-care
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8900:8900"
+    env_file: .env
+    environment:
+      DOCKER_HOST: tcp://socket-proxy-readonly:2375
+      CARE_DB_PATH: /data/care/care.db
+      CARE_ATTACHMENTS_PATH: /data/care/attachments
+      CLOE_CLIENTS_RO: /opt/cloe/clients
+      CLOE_API_DB_RO: /data/cloe-api/cloe.db
+    volumes:
+      - ./data:/data/care
+      - /opt/cloe/clients:/opt/cloe/clients:ro
+      - /opt/cloe-api/cloe.db:/data/cloe-api/cloe.db:ro
+      - /opt/cloe-api/registry.json:/data/cloe-api/registry.json:ro
+      - /opt/cloe/proxy/cloe_proxy.db:/opt/cloe/proxy/cloe_proxy.db:ro
+    networks:
+      - cloe-internal
+      - traefik-public
+      - socket-proxy-readonly
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=traefik-public"
+      - "traefik.http.routers.cloe-care.rule=Host(`care.hellocloe.fr`)"
+      - "traefik.http.routers.cloe-care.entrypoints=websecure"
+      - "traefik.http.routers.cloe-care.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.cloe-care.middlewares=ratelimit-api@file,security-headers@file"
+      - "traefik.http.services.cloe-care.loadbalancer.server.port=8900"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
+        reservations:
+          memory: 128M
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    depends_on:
+      - socket-proxy-readonly
+
+  socket-proxy-readonly:
+    image: tecnativa/docker-socket-proxy:latest
+    container_name: socket-proxy-readonly
+    restart: unless-stopped
+    networks:
+      - socket-proxy-readonly
+    environment:
+      CONTAINERS: 1
+      LOGS: 1
+      INFO: 1
+      VERSION: 1
+      POST: 0
+      EXEC: 0
+      VOLUMES: 0
+      IMAGES: 0
+      NETWORKS: 0
+      SERVICES: 0
+      TASKS: 0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  cloe-internal:
+    external: true
+    name: cloe-internal
+  traefik-public:
+    external: true
+    name: traefik-public
+  socket-proxy-readonly:
+    driver: bridge
