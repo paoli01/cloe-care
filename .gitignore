@@ -6,3 +6,8 @@ attachments/
 *.log
 .pytest_cache/
 .venv/
+
+# Base SQLite runtime (incidents) — non versionnée
+cloe_care.db
+cloe_care.db-shm
+cloe_care.db-wal

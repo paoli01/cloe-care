@@ -1,0 +1,20 @@
+[Unit]
+Description=Cloe Care — Incident management service
+After=network.target cloe-api.service
+Wants=cloe-api.service
+
+[Service]
+User=cloe
+Group=cloe
+WorkingDirectory=/opt/cloe-care
+EnvironmentFile=/opt/cloe-care/.env
+ExecStart=/opt/cloe-care/.venv/bin/uvicorn main:app --host 127.0.0.1 --port 8900 --workers 1 --timeout-graceful-shutdown 10
+Restart=always
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=15
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
